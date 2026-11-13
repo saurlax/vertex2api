@@ -1,23 +1,36 @@
 # vertex2api
 
-用 Vertex AI API Key 调用 Gemini。提供 OpenAI Chat Completions 兼容入口和 Vertex 原生转发入口，支持 SSE。
+A small Go proxy that uses a Vertex AI API key to serve OpenAI-compatible chat completions and forward native Gemini requests.
 
-## 配置
+## Setup
 
-| 环境变量 | 用途 |
+Set these environment variables, then run `go run .` with Go 1.25 or later. You can also build an image using the [Dockerfile](Dockerfile) and pass the same variables at runtime.
+
+| Variable | Value |
 | --- | --- |
-| VERTEX_PROJECT_ID | GCP 项目 ID，必填 |
-| VERTEX_API_KEY | 用于调用该项目 Vertex AI 的 API Key，必填 |
-| API_KEY | 客户端连接 vertex2api 的独立 Bearer Token，必填 |
-| VERTEX_LOCATION | Vertex 区域，默认 global |
-| PORT | 监听端口，默认 8080 |
+| `VERTEX_PROJECT_ID` | Google Cloud project with Vertex AI enabled. Required. |
+| `VERTEX_API_KEY` | Vertex AI API key for that project. Required. |
+| `API_KEY` | Separate bearer token for clients connecting to the proxy. Required. |
+| `VERTEX_LOCATION` | Vertex AI location. Defaults to `global`. |
+| `PORT` | Listen port. Defaults to `8080`. |
 
-设置环境变量后运行 go run .，或使用仓库里的 Dockerfile 构建镜像。
+See [`.env.example`](.env.example) for the variable names and defaults. The program reads its process environment.
 
-## 接口
+## Usage
 
-- POST /v1/chat/completions — OpenAI 文本对话，支持流式和 JSON 输出。
-- GET /v1/models — 返回推荐模型，实际模型可用性由 Vertex 决定。
-- POST /vertex/{version}/models/{model}:{method} — 原样转发 Vertex 请求体与响应，支持 v1 和 v1beta1。例如 /vertex/v1/models/gemini-4-hydrogen:streamGenerateContent?alt=sse。工具调用、多模态、思考签名等使用这个入口。
+Set your OpenAI client's base URL to `http://localhost:8080/v1` and use `API_KEY` as its API key.
 
-OpenAI 客户端 Base URL 填 http://127.0.0.1:8080/v1。以上接口通过 Authorization: Bearer <API_KEY> 验证。上游使用启动时配置的项目、区域和 Vertex Key，超时为 5 分钟。
+```sh
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-4-hydrogen","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /v1/chat/completions` | Text chat, structured JSON output, and SSE streaming. |
+| `GET /v1/models` | Returns a list of suggested model IDs. Vertex AI determines which models you can call. |
+| `POST /vertex/{version}/models/{model}:{method}` | Forwards the native Vertex AI request body and response. Supports `v1` and `v1beta1`. |
+
+Use the native endpoint for tools, multimodal inputs, and thought signatures. For example, `POST /vertex/v1/models/gemini-4-hydrogen:streamGenerateContent?alt=sse` streams a native Vertex AI response. Send the same bearer token as for chat completions. The proxy uses the configured project and location with a five-minute upstream timeout.
