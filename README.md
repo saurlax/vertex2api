@@ -1,39 +1,23 @@
 # vertex2api
 
-将 Vertex AI 的 Gemini 4 接入 OpenAI 兼容的 `chat.completions` 服务。支持普通文本对话、SSE 流式输出和用量统计。
+用 Vertex AI API Key 调用 Gemini。提供 OpenAI Chat Completions 兼容入口和 Vertex 原生转发入口，支持 SSE。
 
-## Setup
+## 配置
 
-参考 [.env.example](.env.example) 设置环境变量。填写启用了 Vertex AI API 的项目 ID 和该项目的 Vertex API Key，另设一个独立的 `API_KEY` 给客户端使用。`VERTEX_LOCATION` 默认为 `global`，`PORT` 默认为 `8080`。
+| 环境变量 | 用途 |
+| --- | --- |
+| VERTEX_PROJECT_ID | GCP 项目 ID，必填 |
+| VERTEX_API_KEY | 用于调用该项目 Vertex AI 的 API Key，必填 |
+| API_KEY | 客户端连接 vertex2api 的独立 Bearer Token，必填 |
+| VERTEX_LOCATION | Vertex 区域，默认 global |
+| PORT | 监听端口，默认 8080 |
 
-```powershell
-go run .
-```
+设置环境变量后运行 go run .，或使用仓库里的 Dockerfile 构建镜像。
 
-容器部署时可以用仓库里的 Dockerfile 构建镜像，并通过运行环境注入同样的变量。
+## 接口
 
-## Usage
+- POST /v1/chat/completions — OpenAI 文本对话，支持流式和 JSON 输出。
+- GET /v1/models — 返回推荐模型，实际模型可用性由 Vertex 决定。
+- POST /vertex/{version}/models/{model}:{method} — 原样转发 Vertex 请求体与响应，支持 v1 和 v1beta1。例如 /vertex/v1/models/gemini-4-hydrogen:streamGenerateContent?alt=sse。工具调用、多模态、思考签名等使用这个入口。
 
-模型使用以下 ID。
-
-```text
-gemini-4-hydrogen
-gemini-4-carbon
-gemini-4-argon
-```
-
-查看模型。
-
-```powershell
-curl.exe http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $env:API_KEY"
-```
-
-调用聊天。
-
-```powershell
-$body = @{ model = 'gemini-4-hydrogen'; messages = @(@{ role = 'user'; content = 'hello' }) } | ConvertTo-Json -Depth 4
-Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions -Method Post `
-  -Headers @{ Authorization = "Bearer $env:API_KEY" } -ContentType 'application/json' -Body $body
-```
-
-OpenAI 客户端的 Base URL 填 `http://127.0.0.1:8080/v1`。请求只发送到配置的 Vertex 项目，该项目的 Cloud Billing 设置决定费用和赠金抵扣。
+OpenAI 客户端 Base URL 填 http://127.0.0.1:8080/v1。以上接口通过 Authorization: Bearer <API_KEY> 验证。上游使用启动时配置的项目、区域和 Vertex Key，超时为 5 分钟。

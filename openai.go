@@ -1,4 +1,4 @@
-package api
+package main
 
 import (
 	"bufio"
@@ -9,23 +9,19 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
-
-	"vertex2api/openai"
-	"vertex2api/providers"
 )
 
-type handler struct{ vertex providers.Vertex }
+type handler struct{ vertex vertexClient }
 
 type completion struct {
-	ID      string        `json:"id"`
-	Object  string        `json:"object"`
-	Created int64         `json:"created"`
-	Model   string        `json:"model"`
-	Choices []choice      `json:"choices"`
-	Usage   *openai.Usage `json:"usage,omitempty"`
+	ID      string     `json:"id"`
+	Object  string     `json:"object"`
+	Created int64      `json:"created"`
+	Model   string     `json:"model"`
+	Choices []choice   `json:"choices"`
+	Usage   *chatUsage `json:"usage,omitempty"`
 }
 
 type choice struct {
@@ -41,7 +37,7 @@ type message struct {
 }
 
 func (h handler) chat(w http.ResponseWriter, r *http.Request) {
-	var input openai.Request
+	var input chatRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
 	if err := decoder.Decode(&input); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -57,17 +53,17 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := strings.TrimPrefix(input.Model, "google/")
-	if !slices.Contains(providers.Models, model) {
-		writeError(w, 404, "model not available")
+	if !resourceID.MatchString(model) {
+		writeError(w, 400, "invalid model ID")
 		return
 	}
-	body, err := providers.Translate(input, model)
+	body, err := translate(input)
 	if err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
 
-	upstream, err := h.vertex.Generate(r.Context(), model, body, input.Stream)
+	upstream, err := h.vertex.generate(r.Context(), model, body, input.Stream)
 	if err != nil {
 		var timeout net.Error
 		if errors.As(err, &timeout) && timeout.Timeout() {
@@ -91,7 +87,7 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		stream(w, upstream, reply, input.StreamOptions.IncludeUsage)
 		return
 	}
-	var result providers.Response
+	var result vertexResponse
 	if json.NewDecoder(io.LimitReader(upstream.Body, 16<<20)).Decode(&result) != nil || len(result.Error) > 0 {
 		writeError(w, 502, "invalid Vertex response")
 		return
@@ -112,14 +108,14 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, reply)
 }
 
-func firstCandidate(result providers.Response) (providers.Candidate, bool) {
+func firstCandidate(result vertexResponse) (vertexCandidate, bool) {
 	if len(result.Candidates) > 0 {
 		return result.Candidates[0], true
 	}
 	if reason := result.PromptFeedback.BlockReason; reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
-		return providers.Candidate{Finish: "SAFETY"}, true
+		return vertexCandidate{Finish: "SAFETY"}, true
 	}
-	return providers.Candidate{}, false
+	return vertexCandidate{}, false
 }
 
 func finishReason(reason string) (string, error) {
@@ -162,9 +158,9 @@ func stream(w http.ResponseWriter, upstream *http.Response, reply completion, in
 		return
 	}
 
-	var usage *openai.Usage
+	var usage *chatUsage
 	var finish string
-	err := readEvents(upstream.Body, func(result providers.Response) error {
+	err := readEvents(upstream.Body, func(result vertexResponse) error {
 		if len(result.Error) > 0 {
 			return errors.New("Vertex stream returned an error")
 		}
@@ -207,7 +203,7 @@ func stream(w http.ResponseWriter, upstream *http.Response, reply completion, in
 	_ = controller.Flush()
 }
 
-func readEvents(body io.Reader, handle func(providers.Response) error) error {
+func readEvents(body io.Reader, handle func(vertexResponse) error) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 4096), 8<<20)
 	var data []string
@@ -215,7 +211,7 @@ func readEvents(body io.Reader, handle func(providers.Response) error) error {
 		if len(data) == 0 {
 			return nil
 		}
-		var event providers.Response
+		var event vertexResponse
 		err := json.Unmarshal([]byte(strings.Join(data, "\n")), &event)
 		data = data[:0]
 		if err != nil {
@@ -237,4 +233,47 @@ func readEvents(body io.Reader, handle func(providers.Response) error) error {
 		return err
 	}
 	return dispatch()
+}
+
+type chatMessage struct {
+	Role      string          `json:"role"`
+	Content   json.RawMessage `json:"content"`
+	ToolCalls json.RawMessage `json:"tool_calls"`
+	Function  json.RawMessage `json:"function_call"`
+}
+
+type chatRequest struct {
+	Model         string        `json:"model"`
+	Messages      []chatMessage `json:"messages"`
+	Stream        bool          `json:"stream"`
+	StreamOptions struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
+	MaxTokens           *int              `json:"max_tokens"`
+	MaxCompletionTokens *int              `json:"max_completion_tokens"`
+	Temperature         *float64          `json:"temperature"`
+	TopP                *float64          `json:"top_p"`
+	Stop                json.RawMessage   `json:"stop"`
+	ReasoningEffort     string            `json:"reasoning_effort"`
+	N                   *int              `json:"n"`
+	Tools               []json.RawMessage `json:"tools"`
+	Functions           []json.RawMessage `json:"functions"`
+	ResponseFormat      *struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	} `json:"response_format"`
+}
+
+type chatUsage struct {
+	Prompt        int `json:"prompt_tokens"`
+	Completion    int `json:"completion_tokens"`
+	Total         int `json:"total_tokens"`
+	PromptDetails struct {
+		Cached int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionDetails struct {
+		Reasoning int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
 }
