@@ -29,8 +29,10 @@ curl http://localhost:8080/v1/chat/completions \
 
 | Endpoint | Behavior |
 | --- | --- |
-| `POST /v1/chat/completions` | Text chat, structured JSON output, and SSE streaming. |
+| `POST /v1/chat/completions` | Text chat, structured JSON output, function tools, and SSE streaming. Supports one choice per request (`n=1`). |
 | `GET /v1/models` | Returns a list of suggested model IDs. Vertex AI determines which models you can call. |
 | `POST /vertex/{version}/models/{model}:{method}` | Forwards the native Vertex AI request body and response. Supports `v1` and `v1beta1`. |
 
-Use the native endpoint for tools, multimodal inputs, and thought signatures. For example, `POST /vertex/v1/models/gemini-4-hydrogen:streamGenerateContent?alt=sse` streams a native Vertex AI response. Send the same bearer token as for chat completions. The proxy uses the configured project and location with a five-minute upstream timeout.
+When a chat completion returns `tool_calls`, send the assistant message back with the complete tool calls, including any `extra_content` thought signatures. Follow it with one `role: "tool"` message per call, using the matching `tool_call_id`.
+
+Use the native endpoint for Vertex built-in tools and multimodal inputs. For example, `POST /vertex/v1/models/gemini-4-hydrogen:streamGenerateContent?alt=sse` streams a native Vertex AI response. Send the same bearer token as for chat completions. The proxy uses the configured project and location with a five-minute upstream timeout.

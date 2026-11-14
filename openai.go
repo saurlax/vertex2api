@@ -32,8 +32,10 @@ type choice struct {
 }
 
 type message struct {
-	Role    string  `json:"role,omitempty"`
-	Content *string `json:"content,omitempty"`
+	Role      string         `json:"role,omitempty"`
+	Content   *string        `json:"content,omitempty"`
+	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
+	Function  *chatFunction  `json:"function_call,omitempty"`
 }
 
 func (h handler) chat(w http.ResponseWriter, r *http.Request) {
@@ -83,8 +85,9 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply := completion{ID: "chatcmpl-" + rand.Text(), Object: "chat.completion", Created: time.Now().Unix(), Model: model}
+	legacy := len(input.Functions) > 0
 	if input.Stream {
-		stream(w, upstream, reply, input.StreamOptions.IncludeUsage)
+		stream(w, upstream, reply, input.StreamOptions.IncludeUsage, legacy)
 		return
 	}
 	var result vertexResponse
@@ -103,7 +106,19 @@ func (h handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text := candidate.Text()
-	reply.Choices = []choice{{Message: &message{Role: "assistant", Content: &text}, Finish: &reason}}
+	response := message{Role: "assistant", Content: &text}
+	calls := candidate.toolCalls(0, false)
+	if len(calls) > 0 {
+		if text == "" {
+			response.Content = nil
+		}
+		if err := response.setToolCalls(calls, legacy); err != nil {
+			writeError(w, 502, err.Error())
+			return
+		}
+		reason = toolFinishReason(reason, legacy)
+	}
+	reply.Choices = []choice{{Message: &response, Finish: &reason}}
 	reply.Usage = result.Usage.OpenAI()
 	writeJSON(w, 200, reply)
 }
@@ -133,7 +148,7 @@ func finishReason(reason string) (string, error) {
 	}
 }
 
-func stream(w http.ResponseWriter, upstream *http.Response, reply completion, includeUsage bool) {
+func stream(w http.ResponseWriter, upstream *http.Response, reply completion, includeUsage, legacy bool) {
 	if !strings.HasPrefix(upstream.Header.Get("Content-Type"), "text/event-stream") {
 		writeError(w, 502, "Vertex did not return an event stream")
 		return
@@ -160,6 +175,7 @@ func stream(w http.ResponseWriter, upstream *http.Response, reply completion, in
 
 	var usage *chatUsage
 	var finish string
+	callCount := 0
 	err := readEvents(upstream.Body, func(result vertexResponse) error {
 		if len(result.Error) > 0 {
 			return errors.New("Vertex stream returned an error")
@@ -178,8 +194,20 @@ func stream(w http.ResponseWriter, upstream *http.Response, reply completion, in
 		if reason != "" {
 			finish = reason
 		}
+		var delta message
 		if text := candidate.Text(); text != "" {
-			reply.Choices = []choice{{Delta: &message{Content: &text}}}
+			delta.Content = &text
+		}
+		calls := candidate.toolCalls(callCount, true)
+		if legacy && callCount+len(calls) > 1 {
+			return errors.New("Vertex returned multiple calls for legacy functions")
+		}
+		if err := delta.setToolCalls(calls, legacy); err != nil {
+			return err
+		}
+		callCount += len(calls)
+		if delta.Content != nil || len(calls) > 0 {
+			reply.Choices = []choice{{Delta: &delta}}
 			return send(reply)
 		}
 		return nil
@@ -187,6 +215,9 @@ func stream(w http.ResponseWriter, upstream *http.Response, reply completion, in
 	if err != nil || finish == "" {
 		_ = send(errorBody(502, "Vertex stream ended before completion"))
 		return
+	}
+	if callCount > 0 {
+		finish = toolFinishReason(finish, legacy)
 	}
 	reply.Choices = []choice{{Delta: &message{}, Finish: &finish}}
 	if err := send(reply); err != nil {
@@ -236,10 +267,12 @@ func readEvents(body io.Reader, handle func(vertexResponse) error) error {
 }
 
 type chatMessage struct {
-	Role      string          `json:"role"`
-	Content   json.RawMessage `json:"content"`
-	ToolCalls json.RawMessage `json:"tool_calls"`
-	Function  json.RawMessage `json:"function_call"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	Name       string          `json:"name"`
+	ToolCallID string          `json:"tool_call_id"`
+	ToolCalls  []chatToolCall  `json:"tool_calls"`
+	Function   *chatFunction   `json:"function_call"`
 }
 
 type chatRequest struct {
@@ -249,15 +282,17 @@ type chatRequest struct {
 	StreamOptions struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
-	MaxTokens           *int              `json:"max_tokens"`
-	MaxCompletionTokens *int              `json:"max_completion_tokens"`
-	Temperature         *float64          `json:"temperature"`
-	TopP                *float64          `json:"top_p"`
-	Stop                json.RawMessage   `json:"stop"`
-	ReasoningEffort     string            `json:"reasoning_effort"`
-	N                   *int              `json:"n"`
-	Tools               []json.RawMessage `json:"tools"`
-	Functions           []json.RawMessage `json:"functions"`
+	MaxTokens           *int                  `json:"max_tokens"`
+	MaxCompletionTokens *int                  `json:"max_completion_tokens"`
+	Temperature         *float64              `json:"temperature"`
+	TopP                *float64              `json:"top_p"`
+	Stop                json.RawMessage       `json:"stop"`
+	ReasoningEffort     string                `json:"reasoning_effort"`
+	N                   *int                  `json:"n"`
+	Tools               []chatTool            `json:"tools"`
+	Functions           []functionDeclaration `json:"functions"`
+	ToolChoice          json.RawMessage       `json:"tool_choice"`
+	FunctionChoice      json.RawMessage       `json:"function_call"`
 	ResponseFormat      *struct {
 		Type       string `json:"type"`
 		JSONSchema struct {

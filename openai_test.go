@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,6 +9,113 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestToolCallsRoundTrip(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "stream"}[streaming], func(t *testing.T) {
+			turn := 0
+			vertex := newVertex("trial-project", "global", "vertex-key")
+			vertex.Client.Transport = transport(func(r *http.Request) (*http.Response, error) {
+				turn++
+				var body vertexRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.HasPrefix(r.URL.Path, "/v1beta1/") || len(body.Tools) != 1 ||
+					body.Tools[0].Declarations[0].Name != "lookup" || body.ToolConfig.Calling.Mode != "ANY" {
+					t.Fatalf("incorrect Vertex tool request: %+v", body)
+				}
+				result := `{"candidates":[{"content":{"parts":[{"functionCall":{"id":"native-id","name":"lookup","args":{"q":"Paris"}},"thoughtSignature":"opaque"}]},"finishReason":"STOP"}]}`
+				contentType := "application/json"
+				if turn == 2 {
+					if len(body.Contents) != 3 || len(body.Contents[1].Parts) != 2 || len(body.Contents[2].Parts) != 2 {
+						t.Fatalf("invalid parallel call history: %+v", body.Contents)
+					}
+					call, second := body.Contents[1].Parts[0], body.Contents[1].Parts[1]
+					firstResult, secondResult := body.Contents[2].Parts[0].FunctionResponse, body.Contents[2].Parts[1].FunctionResponse
+					if call.ThoughtSignature != "opaque" || call.Text != nil || call.FunctionCall.ID != "native-id" ||
+						second.FunctionCall.ID != "" || firstResult.ID != "native-id" || secondResult.ID != "" ||
+						string(firstResult.Response) != `{"status":"ok"}` || string(secondResult.Response) != `{"output":"London"}` {
+						t.Fatalf("incorrect tool replay: %+v", body.Contents)
+					}
+					result = `{"candidates":[{"content":{"parts":[{"text":"Done"}]},"finishReason":"STOP"}]}`
+				}
+				if strings.HasSuffix(r.URL.Path, ":streamGenerateContent") {
+					contentType = "text/event-stream"
+					result = strings.Replace(result, `,"finishReason":"STOP"`, "", 1)
+					result = "data: " + result + "\n\n" +
+						"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"London\"}}}]},\"finishReason\":\"STOP\"}]}\n\n"
+				} else if turn == 1 {
+					result = strings.Replace(result, `"opaque"}`, `"opaque"},{"functionCall":{"name":"lookup","args":{"q":"London"}}}`, 1)
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(result))}, nil
+			})
+			router := newRouter(config{APIKey: "gateway-key"}, vertex)
+			input := chatRequest{
+				Model: "gemini-4-hydrogen", Stream: streaming, ToolChoice: json.RawMessage(`"required"`),
+				Messages: []chatMessage{{Role: "user", Content: json.RawMessage(`"Look up Paris and London"`)}},
+				Tools:    []chatTool{{Type: "function", Function: functionDeclaration{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}}},
+			}
+			send := func() string {
+				payload, err := json.Marshal(input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(payload))
+				req.Header.Set("Authorization", "Bearer gateway-key")
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				if w.Code != 200 {
+					t.Fatalf("unexpected response %d %s", w.Code, w.Body.String())
+				}
+				return w.Body.String()
+			}
+			first := send()
+			var calls []chatToolCall
+			if streaming {
+				if !strings.HasSuffix(first, "data: [DONE]\n\n") || !strings.Contains(first, `"finish_reason":"tool_calls"`) {
+					t.Fatalf("incomplete SSE: %s", first)
+				}
+				for _, line := range strings.Split(first, "\n") {
+					payload, ok := strings.CutPrefix(line, "data: ")
+					if !ok || payload == "[DONE]" {
+						continue
+					}
+					var chunk completion
+					if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+						t.Fatal(err)
+					}
+					calls = append(calls, chunk.Choices[0].Delta.ToolCalls...)
+				}
+			} else {
+				var reply completion
+				if err := json.Unmarshal([]byte(first), &reply); err != nil {
+					t.Fatal(err)
+				}
+				calls = reply.Choices[0].Message.ToolCalls
+				if *reply.Choices[0].Finish != "tool_calls" {
+					t.Fatalf("incorrect finish reason: %s", first)
+				}
+			}
+			if len(calls) != 2 || calls[0].Extra == nil || calls[0].Extra.Google.Signature != "opaque" ||
+				calls[0].ID != "native-id" || calls[1].ID == "" {
+				t.Fatalf("incorrect tool calls: %s", first)
+			}
+			if streaming && (calls[0].Index == nil || *calls[0].Index != 0 || calls[1].Index == nil || *calls[1].Index != 1) {
+				t.Fatalf("incorrect streaming tool indices: %s", first)
+			}
+			input.Stream = false
+			input.Messages = append(input.Messages,
+				chatMessage{Role: "assistant", Content: json.RawMessage("null"), ToolCalls: calls},
+				chatMessage{Role: "tool", ToolCallID: calls[1].ID, Content: json.RawMessage(`"London"`)},
+				chatMessage{Role: "tool", ToolCallID: calls[0].ID, Content: json.RawMessage(`"{\"status\":\"ok\"}"`)},
+			)
+			if second := send(); !strings.Contains(second, `"content":"Done"`) || turn != 2 {
+				t.Fatalf("incorrect follow-up: %s", second)
+			}
+		})
+	}
+}
 
 type transport func(*http.Request) (*http.Response, error)
 
@@ -32,7 +140,7 @@ func TestChat(t *testing.T) {
 					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 						t.Fatal(err)
 					}
-					if body.Contents[1].Role != "model" || body.System.Parts[0].Text != "Be brief" || *body.Config.MaxOutputTokens != 32 {
+					if body.Contents[1].Role != "model" || *body.System.Parts[0].Text != "Be brief" || *body.Config.MaxOutputTokens != 32 {
 						t.Fatalf("unexpected Vertex body: %+v", body)
 					}
 					result := `{"candidates":[{"content":{"parts":[{"thought":true,"text":"hidden"},{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"thoughtsTokenCount":3,"totalTokenCount":6}}`

@@ -29,8 +29,11 @@ func newVertex(project, location, key string) vertexClient {
 }
 
 type vertexPart struct {
-	Text    string `json:"text"`
-	Thought bool   `json:"thought,omitempty"`
+	Text             *string                 `json:"text,omitempty"`
+	Thought          bool                    `json:"thought,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
+	FunctionCall     *vertexFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *vertexFunctionResponse `json:"functionResponse,omitempty"`
 }
 
 type vertexContent struct {
@@ -53,9 +56,12 @@ type thinkingConfig struct {
 }
 
 type vertexRequest struct {
-	Contents []vertexContent  `json:"contents"`
-	System   *vertexContent   `json:"systemInstruction,omitempty"`
-	Config   generationConfig `json:"generationConfig"`
+	Contents    []vertexContent   `json:"contents"`
+	System      *vertexContent    `json:"systemInstruction,omitempty"`
+	Config      generationConfig  `json:"generationConfig"`
+	Tools       []vertexTool      `json:"tools,omitempty"`
+	ToolConfig  *vertexToolConfig `json:"toolConfig,omitempty"`
+	toolHistory bool
 }
 
 type vertexCandidate struct {
@@ -66,8 +72,8 @@ type vertexCandidate struct {
 func (c vertexCandidate) Text() string {
 	var result strings.Builder
 	for _, part := range c.Content.Parts {
-		if !part.Thought {
-			result.WriteString(part.Text)
+		if !part.Thought && part.Text != nil {
+			result.WriteString(*part.Text)
 		}
 	}
 	return result.String()
@@ -106,7 +112,7 @@ func (u *vertexUsage) OpenAI() *chatUsage {
 func messageParts(raw json.RawMessage) ([]vertexPart, error) {
 	var text *string
 	if json.Unmarshal(raw, &text) == nil && text != nil {
-		return []vertexPart{{Text: *text}}, nil
+		return []vertexPart{{Text: text}}, nil
 	}
 	var items []struct {
 		Type string  `json:"type"`
@@ -120,24 +126,24 @@ func messageParts(raw json.RawMessage) ([]vertexPart, error) {
 		if item.Type != "text" || item.Text == nil {
 			return nil, errors.New("only text message parts are supported")
 		}
-		parts = append(parts, vertexPart{Text: *item.Text})
+		parts = append(parts, vertexPart{Text: item.Text})
 	}
 	return parts, nil
 }
 
 func translate(input chatRequest) (vertexRequest, error) {
-	if (input.N != nil && *input.N != 1) || len(input.Tools) > 0 || len(input.Functions) > 0 {
-		return vertexRequest{}, errors.New("use the native Vertex endpoint for tools or multiple choices")
+	if input.N != nil && *input.N != 1 {
+		return vertexRequest{}, errors.New("chat completions supports one choice per request; set n to 1")
 	}
-	var output vertexRequest
-	for _, message := range input.Messages {
-		parts, err := messageParts(message.Content)
+	output, err := translateTools(input)
+	if err != nil {
+		return vertexRequest{}, err
+	}
+	for i := 0; i < len(input.Messages); i++ {
+		message := input.Messages[i]
+		parts, err := message.parts()
 		if err != nil {
 			return vertexRequest{}, err
-		}
-		if len(message.ToolCalls) > 0 && string(message.ToolCalls) != "null" && string(message.ToolCalls) != "[]" ||
-			len(message.Function) > 0 && string(message.Function) != "null" {
-			return vertexRequest{}, errors.New("tool calls are unsupported")
 		}
 		switch message.Role {
 		case "system", "developer":
@@ -154,11 +160,23 @@ func translate(input chatRequest) (vertexRequest, error) {
 				role = "model"
 			}
 			last := len(output.Contents) - 1
-			if last >= 0 && output.Contents[last].Role == role {
+			if last >= 0 && output.Contents[last].Role == role &&
+				output.Contents[last].Parts[0].FunctionResponse == nil {
 				output.Contents[last].Parts = append(output.Contents[last].Parts, parts...)
 			} else {
 				output.Contents = append(output.Contents, vertexContent{Role: role, Parts: parts})
 			}
+			if len(message.ToolCalls) > 0 || message.Function != nil {
+				output.toolHistory = true
+				results, err := message.toolResults(input.Messages[i+1:])
+				if err != nil {
+					return vertexRequest{}, err
+				}
+				output.Contents = append(output.Contents, vertexContent{Role: "user", Parts: results})
+				i += len(results)
+			}
+		case "tool", "function":
+			return vertexRequest{}, errors.New("tool result has no preceding assistant call")
 		default:
 			return vertexRequest{}, errors.New("unsupported message role")
 		}
@@ -225,7 +243,11 @@ func (v vertexClient) generate(ctx context.Context, model string, body vertexReq
 	if stream {
 		action = model + ":streamGenerateContent"
 	}
-	endpoint := v.endpoint("v1", action)
+	version := "v1"
+	if len(body.Tools) > 0 || body.toolHistory {
+		version = "v1beta1"
+	}
+	endpoint := v.endpoint(version, action)
 	if stream {
 		endpoint.RawQuery = "alt=sse"
 	}
