@@ -216,7 +216,18 @@ func translate(input chatRequest) (vertexRequest, error) {
 		}
 	}
 	if input.ReasoningEffort != "" {
-		output.Config.Thinking = &thinkingConfig{Level: strings.ToUpper(input.ReasoningEffort)}
+		level := strings.ToUpper(input.ReasoningEffort)
+		model := strings.TrimPrefix(input.Model, "google/")
+		if model == "gemini-4-argon" || model == "gemini-4-carbon" ||
+			strings.HasPrefix(model, "gemini-4-argon-") || strings.HasPrefix(model, "gemini-4-carbon-") {
+			switch level {
+			case "NONE", "MINIMAL":
+				level = "LOW"
+			case "XHIGH":
+				level = "HIGH"
+			}
+		}
+		output.Config.Thinking = &thinkingConfig{Level: level}
 	}
 	return output, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -24,6 +25,40 @@ type chatToolCall struct {
 	Index    *int           `json:"index,omitempty"`
 	Function chatFunction   `json:"function"`
 	Extra    *functionExtra `json:"extra_content,omitempty"`
+}
+
+const signedToolCallPrefix = "call_vertex2api_v1_"
+
+type signedToolCall struct {
+	ID        string `json:"id,omitempty"`
+	Signature string `json:"signature"`
+	Nonce     string `json:"nonce,omitempty"`
+}
+
+// Some OpenAI clients only round-trip the standard tool call fields.
+func signedToolCallID(id, signature string) string {
+	identity := signedToolCall{ID: id, Signature: signature}
+	if id == "" {
+		identity.Nonce = rand.Text()
+	}
+	data, _ := json.Marshal(identity)
+	return signedToolCallPrefix + base64.RawURLEncoding.EncodeToString(data)
+}
+
+func (c chatToolCall) signedIdentity() signedToolCall {
+	encoded, ok := strings.CutPrefix(c.ID, signedToolCallPrefix)
+	if !ok {
+		return signedToolCall{}
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return signedToolCall{}
+	}
+	var identity signedToolCall
+	if json.Unmarshal(data, &identity) != nil || identity.Signature == "" {
+		return signedToolCall{}
+	}
+	return identity
 }
 
 type chatFunction struct {
@@ -178,12 +213,18 @@ func (m chatMessage) parts() ([]vertexPart, error) {
 			return nil, err
 		}
 		part.FunctionCall.ID = call.vertexID()
+		if part.ThoughtSignature == "" {
+			part.ThoughtSignature = call.signedIdentity().Signature
+		}
 		parts = append(parts, part)
 	}
 	return parts, nil
 }
 
 func (c chatToolCall) vertexID() string {
+	if identity := c.signedIdentity(); identity.Signature != "" {
+		return identity.ID
+	}
 	// IDs generated for the OpenAI client are absent in the Vertex replay.
 	if strings.HasPrefix(c.ID, "call_vertex2api_") {
 		return ""
@@ -273,7 +314,9 @@ func (c vertexCandidate) toolCalls(start int, stream bool) []chatToolCall {
 			continue
 		}
 		id := call.ID
-		if id == "" {
+		if part.ThoughtSignature != "" {
+			id = signedToolCallID(id, part.ThoughtSignature)
+		} else if id == "" {
 			id = "call_vertex2api_" + rand.Text()
 		}
 		args := string(call.Args)

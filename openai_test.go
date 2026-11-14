@@ -98,13 +98,15 @@ func TestToolCallsRoundTrip(t *testing.T) {
 				}
 			}
 			if len(calls) != 2 || calls[0].Extra == nil || calls[0].Extra.Google.Signature != "opaque" ||
-				calls[0].ID != "native-id" || calls[1].ID == "" {
+				calls[0].ID == "" || calls[1].ID == "" {
 				t.Fatalf("incorrect tool calls: %s", first)
 			}
 			if streaming && (calls[0].Index == nil || *calls[0].Index != 0 || calls[1].Index == nil || *calls[1].Index != 1) {
 				t.Fatalf("incorrect streaming tool indices: %s", first)
 			}
 			input.Stream = false
+			// A gateway may forward only the standard OpenAI tool call fields.
+			calls[0].Extra = nil
 			input.Messages = append(input.Messages,
 				chatMessage{Role: "assistant", Content: json.RawMessage("null"), ToolCalls: calls},
 				chatMessage{Role: "tool", ToolCallID: calls[1].ID, Content: json.RawMessage(`"London"`)},
@@ -112,6 +114,26 @@ func TestToolCallsRoundTrip(t *testing.T) {
 			)
 			if second := send(); !strings.Contains(second, `"content":"Done"`) || turn != 2 {
 				t.Fatalf("incorrect follow-up: %s", second)
+			}
+		})
+	}
+}
+
+func TestGemini4ReasoningEffort(t *testing.T) {
+	for _, tc := range []struct{ model, effort, want string }{
+		{"gemini-4-argon", "xhigh", "HIGH"},
+		{"google/gemini-4-argon", "minimal", "LOW"},
+		{"gemini-4-argon-cyber-permissive", "none", "LOW"},
+		{"gemini-4-carbon", "medium", "MEDIUM"},
+		{"gemini-4-hydrogen", "xhigh", "XHIGH"},
+	} {
+		t.Run(tc.model+"/"+tc.effort, func(t *testing.T) {
+			request, err := translate(chatRequest{
+				Model: tc.model, ReasoningEffort: tc.effort,
+				Messages: []chatMessage{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+			})
+			if err != nil || request.Config.Thinking.Level != tc.want {
+				t.Fatalf("unexpected thinking config %+v, err=%v", request.Config.Thinking, err)
 			}
 		})
 	}
